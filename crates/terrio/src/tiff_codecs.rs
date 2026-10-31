@@ -229,7 +229,7 @@ fn crate_misreads_samples(photometric: Option<u16>, samples: usize, extra: &[u16
 }
 
 /// An error with a message, as the `tiff` crate reports I/O errors.
-fn invalid(msg: impl Into<String>) -> TiffError {
+pub(crate) fn invalid(msg: impl Into<String>) -> TiffError {
     TiffError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into()))
 }
 
@@ -399,6 +399,7 @@ impl ChunkCodec {
         if self.codec == Codec::CratePacked {
             return self.read_crate_packed(dec, idx);
         }
+        self.tables.ensure(dec, std::iter::once(idx as usize))?;
         let Some((offset, count)) = self.tables.get(idx as usize) else {
             return Err(invalid(format!("no TIFF chunk {idx}")));
         };

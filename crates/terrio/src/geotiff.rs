@@ -10,6 +10,7 @@
 //! `ModelTransformationTag` geotransforms, user-defined projected CRSs (common in NASA products)
 //! and `GDAL_NODATA`.
 
+use crate::tiff_codecs::invalid;
 use std::io::{Read, Seek, SeekFrom};
 
 const MODEL_PIXEL_SCALE: u16 = 33550;
@@ -965,29 +966,161 @@ fn decode_chunk<R: Read + Seek>(
     }
 }
 
+/// Images with at least this many chunks have their chunk tables read in blocks of
+/// [`LAZY_BLOCK`] entries, as windows need them (GDAL's deferred strile loading), rather than
+/// whole: a COG with millions of tiles then costs a window a few kilobytes of tables, not tens
+/// of megabytes. The vendored `tiff` crate applies the same threshold to its own copy.
+pub(crate) const LAZY_CHUNK_TABLES_FROM: u64 = 1 << 16;
+/// Entries read together from a lazy table: 8 KiB of `LONG8` offsets.
+const LAZY_BLOCK: usize = 1024;
+
 /// The offsets and byte counts of the chunks (tiles or strips) of one TIFF image, from its
 /// `TileOffsets` and `TileByteCounts` (or `StripOffsets` and `StripByteCounts`). The `tiff` crate
 /// keeps its own copy out of reach: its `get_tag_u64_vec` reads and decodes the tags again.
+///
+/// Small images hold their tables whole. Images of [`LAZY_CHUNK_TABLES_FROM`] chunks or more
+/// hold the blocks of entries that reads have asked for ([`ChunkTables::ensure`]), shared by
+/// every reader of the level; [`ChunkTables::get`] answers from them.
 #[derive(Debug, Default)]
 pub(crate) struct ChunkTables {
-    pub offsets: Vec<u64>,
-    pub counts: Vec<u64>,
+    whole: Option<(Vec<u64>, Vec<u64>)>,
+    lazy: Option<LazyTables>,
+}
+
+/// The offsets and byte counts of one block of [`LAZY_BLOCK`] chunks.
+type TableBlock = (Vec<u64>, Vec<u64>);
+
+/// The entries of a lazy table and the blocks of it read so far.
+#[derive(Debug)]
+struct LazyTables {
+    count: usize,
+    /// The entry size in bytes (2, 4 or 8) of the offsets and of the byte counts.
+    sizes: (usize, usize),
+    little_endian: bool,
+    tags: (tiff::tags::Tag, tiff::tags::Tag),
+    blocks: std::sync::Mutex<std::collections::HashMap<usize, TableBlock>>,
 }
 
 impl ChunkTables {
-    /// The tables of the image the decoder is positioned on, read whole.
+    /// The tables of the image the decoder is positioned on: read whole, or, for an image of
+    /// [`LAZY_CHUNK_TABLES_FROM`] chunks or more, prepared for reading by block.
     pub(crate) fn read<R: Read + Seek>(dec: &mut tiff::decoder::Decoder<R>) -> tiff::TiffResult<Self> {
-        use tiff::tags::Tag;
+        use tiff::tags::{Tag, Type};
         let (offsets, counts) = match dec.get_chunk_type() {
             tiff::decoder::ChunkType::Tile => (Tag::TileOffsets, Tag::TileByteCounts),
             tiff::decoder::ChunkType::Strip => (Tag::StripOffsets, Tag::StripByteCounts),
         };
-        Ok(Self { offsets: dec.get_tag_u64_vec(offsets)?, counts: dec.get_tag_u64_vec(counts)? })
+        let entry_size = |t: Type| match t {
+            Type::SHORT => Some(2),
+            Type::LONG => Some(4),
+            Type::LONG8 => Some(8),
+            _ => None,
+        };
+        let ifd = dec.image_ifd();
+        let (Some(oe), Some(ce)) = (ifd.find_entry(offsets), ifd.find_entry(counts)) else {
+            return Err(invalid("TIFF image without chunk offsets or byte counts"));
+        };
+        let count = oe.count();
+        if count >= LAZY_CHUNK_TABLES_FROM
+            && count == ce.count()
+            && let (Some(os), Some(cs)) = (entry_size(oe.field_type()), entry_size(ce.field_type()))
+        {
+            // The byte order, from the file's first two bytes.
+            let r = dec.inner();
+            r.seek(SeekFrom::Start(0))?;
+            let mut magic = [0u8; 2];
+            r.read_exact(&mut magic)?;
+            let count = usize::try_from(count).map_err(|_| invalid("too many TIFF chunks"))?;
+            let lazy =
+                LazyTables { count, sizes: (os, cs), little_endian: &magic == b"II", tags: (offsets, counts), blocks: Default::default() };
+            return Ok(Self { whole: None, lazy: Some(lazy) });
+        }
+        Ok(Self { whole: Some((dec.get_tag_u64_vec(offsets)?, dec.get_tag_u64_vec(counts)?)), lazy: None })
     }
 
-    /// The offset and byte count of chunk `i`, `None` past the end of either table.
+    /// Reads the blocks of a lazy table that hold `chunks` and are not held yet, each run of
+    /// adjacent blocks in one read of the offsets and one of the byte counts. The decoder must
+    /// be positioned on the tables' image. Nothing to do for tables read whole.
+    pub(crate) fn ensure<R: Read + Seek>(
+        &self,
+        dec: &mut tiff::decoder::Decoder<R>,
+        chunks: impl IntoIterator<Item = usize>,
+    ) -> tiff::TiffResult<()> {
+        let Some(lazy) = &self.lazy else { return Ok(()) };
+        let mut wanted: Vec<usize> = {
+            let held = lazy.blocks.lock().unwrap_or_else(|e| e.into_inner());
+            chunks.into_iter().filter(|c| *c < lazy.count).map(|c| c / LAZY_BLOCK).filter(|b| !held.contains_key(b)).collect()
+        };
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut i = 0;
+        while i < wanted.len() {
+            let first = wanted[i];
+            let mut last = first;
+            while i + 1 < wanted.len() && wanted[i + 1] == last + 1 {
+                i += 1;
+                last = wanted[i];
+            }
+            i += 1;
+            let start = first * LAZY_BLOCK;
+            let end = ((last + 1) * LAZY_BLOCK).min(lazy.count);
+            let offsets = lazy.read_run(dec, lazy.tags.0, lazy.sizes.0, start, end)?;
+            let counts = lazy.read_run(dec, lazy.tags.1, lazy.sizes.1, start, end)?;
+            let mut held = lazy.blocks.lock().unwrap_or_else(|e| e.into_inner());
+            for b in first..=last {
+                let lo = (b - first) * LAZY_BLOCK;
+                let hi = (lo + LAZY_BLOCK).min(offsets.len());
+                held.insert(b, (offsets[lo..hi].to_vec(), counts[lo..hi].to_vec()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The offset and byte count of chunk `i`, `None` past the end of either table, or in a
+    /// block of a lazy table that no [`ensure`](Self::ensure) has read.
     pub(crate) fn get(&self, i: usize) -> Option<(u64, u64)> {
-        Some((*self.offsets.get(i)?, *self.counts.get(i)?))
+        if let Some((offsets, counts)) = &self.whole {
+            return Some((*offsets.get(i)?, *counts.get(i)?));
+        }
+        let lazy = self.lazy.as_ref()?;
+        let held = lazy.blocks.lock().unwrap_or_else(|e| e.into_inner());
+        let (offsets, counts) = held.get(&(i / LAZY_BLOCK))?;
+        let k = i % LAZY_BLOCK;
+        Some((*offsets.get(k)?, *counts.get(k)?))
+    }
+}
+
+impl LazyTables {
+    /// Entries `start..end` of the array entry `tag`, each `size` bytes, as integers.
+    fn read_run<R: Read + Seek>(
+        &self,
+        dec: &mut tiff::decoder::Decoder<R>,
+        tag: tiff::tags::Tag,
+        size: usize,
+        start: usize,
+        end: usize,
+    ) -> tiff::TiffResult<Vec<u64>> {
+        let n = end - start;
+        let mut buf = vec![0u8; n * size];
+        let read = dec.image_ifd().find_tag_bytes(tag, &mut buf, (start * size) as u64)?;
+        if read != Some(buf.len()) {
+            return Err(invalid(format!("TIFF chunk table entries {start}..{end}: {} of {} bytes read", read.unwrap_or(0), buf.len())));
+        }
+        let le = self.little_endian;
+        Ok(buf
+            .chunks_exact(size)
+            .map(|b| match size {
+                2 => u64::from(if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) }),
+                4 => {
+                    let a = [b[0], b[1], b[2], b[3]];
+                    u64::from(if le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) })
+                }
+                _ => {
+                    let a: [u8; 8] = b.try_into().unwrap_or_default();
+                    if le { u64::from_le_bytes(a) } else { u64::from_be_bytes(a) }
+                }
+            })
+            .collect())
     }
 }
 

@@ -1747,6 +1747,8 @@ impl TiffRaster {
                 }
             }
         }
+        // Lazy tables: the entries of these chunks, in as few reads as their blocks allow.
+        tables.ensure(dec, chunks.iter().map(|(i, ..)| *i)).map_err(tiff_err)?;
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         crate::dataset::fallible::reserve(&mut ranges, chunks.len(), what)?;
         ranges.extend(chunks.iter().filter_map(|(i, ..)| tables.get(*i)).filter(|(_, n)| *n > 0));
@@ -1779,7 +1781,7 @@ impl TiffRaster {
         let mut targets: std::collections::HashMap<u32, Vec<ChunkTarget>> = std::collections::HashMap::new();
         targets.try_reserve(chunks.len()).map_err(|_| crate::dataset::fallible::out_of_memory(None, what))?;
         for (idx, x0, y0, map) in chunks {
-            if tables.counts.get(idx).copied().unwrap_or(0) == 0 {
+            if tables.get(idx).map(|(_, n)| n).unwrap_or(0) == 0 {
                 continue;
             }
             let t = targets.entry(idx as u32).or_default();
@@ -1980,6 +1982,108 @@ pub(crate) fn sample_type<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<(DataT
 
 #[cfg(test)]
 mod tests {
+    /// A little-endian BigTIFF of `tiles` x `tiles` 16 x 16 Byte tiles, sparse except `filled`
+    /// (tile index, fill value): the IFD, then the tile offsets and byte counts, then the tiles.
+    fn sparse_bigtiff(tiles: u64, filled: &[(u64, u8)]) -> Vec<u8> {
+        let side = tiles * 16;
+        let n = tiles * tiles;
+        let mut b = Vec::new();
+        b.extend(b"II");
+        b.extend(43u16.to_le_bytes());
+        b.extend(8u16.to_le_bytes());
+        b.extend(0u16.to_le_bytes());
+        b.extend(16u64.to_le_bytes());
+        let entries: Vec<(u16, u16, u64, u64)> = vec![
+            (256, 4, 1, side),
+            (257, 4, 1, side),
+            (258, 3, 1, 8),
+            (259, 3, 1, 1),
+            (262, 3, 1, 1),
+            (277, 3, 1, 1),
+            (284, 3, 1, 1),
+            (322, 3, 1, 16),
+            (323, 3, 1, 16),
+            (324, 16, n, 0),
+            (325, 16, n, 0),
+            (339, 3, 1, 1),
+        ];
+        let ifd_len = 8 + entries.len() as u64 * 20 + 8;
+        let offsets_at = 16 + ifd_len;
+        let counts_at = offsets_at + 8 * n;
+        let data_at = counts_at + 8 * n;
+        b.extend((entries.len() as u64).to_le_bytes());
+        for (tag, typ, count, value) in &entries {
+            b.extend(tag.to_le_bytes());
+            b.extend(typ.to_le_bytes());
+            b.extend(count.to_le_bytes());
+            let value = match tag {
+                324 => offsets_at,
+                325 => counts_at,
+                _ => *value,
+            };
+            b.extend(value.to_le_bytes());
+        }
+        b.extend(0u64.to_le_bytes());
+        let mut offsets = vec![0u64; n as usize];
+        let mut counts = vec![0u64; n as usize];
+        for (i, (tile, _)) in filled.iter().enumerate() {
+            offsets[*tile as usize] = data_at + 256 * i as u64;
+            counts[*tile as usize] = 256;
+        }
+        offsets.iter().chain(&counts).for_each(|v| b.extend(v.to_le_bytes()));
+        for (_, value) in filled {
+            b.extend(std::iter::repeat_n(*value, 256));
+        }
+        b
+    }
+
+    /// Bytes requested from the test server: the sum of its `bytes=a-b` ranges.
+    fn bytes_requested(seen: &Mutex<Vec<Option<String>>>) -> u64 {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|h| match h.as_deref().and_then(|h| h.strip_prefix("bytes=")).and_then(|r| r.split_once('-')) {
+                Some((a, b)) => b.parse::<u64>().unwrap_or(0) - a.parse::<u64>().unwrap_or(0) + 1,
+                None => u64::MAX / 4,
+            })
+            .sum()
+    }
+
+    /// A window of an image with more chunks than `LAZY_CHUNK_TABLES_FROM` reads the entries of
+    /// its chunks, not the whole tables: remotely, in a few kilobytes of the megabyte of tables.
+    #[test]
+    fn large_tile_tables_are_read_by_block() {
+        let tiles = 272u64; // 73,984 tiles, over the 65,536 of LAZY_CHUNK_TABLES_FROM.
+        assert!(tiles * tiles > crate::geotiff::LAZY_CHUNK_TABLES_FROM);
+        let filled = [(0u64, 7u8), (100 * tiles + 100, 42), (tiles * tiles - 1, 9)];
+        let bytes = sparse_bigtiff(tiles, &filled);
+        let tables_len = 2 * 8 * tiles * tiles;
+        let opts = |overview| WindowOptions { bands: vec![1], overview };
+        let check = |r: &mut LazyRaster| {
+            assert_eq!((r.width(), r.height()), (4352, 4352));
+            let mut w = |x, y| r.read_window(Window::new(x, y, 16, 16), &opts(None)).unwrap().raster.data.to_f64_vec();
+            assert!(w(1600, 1600).iter().all(|v| *v == 42.0));
+            assert!(w(0, 0).iter().all(|v| *v == 7.0));
+            assert!(w(4336, 4336).iter().all(|v| *v == 9.0));
+            // A sparse tile reads as 0, and a window over four tiles.
+            assert!(w(16, 16).iter().all(|v| *v == 0.0));
+            let four = r.read_window(Window::new(1592, 1592, 16, 16), &opts(None)).unwrap().raster.data.to_f64_vec();
+            assert_eq!(four.iter().filter(|v| **v == 42.0).count(), 64);
+        };
+
+        let (base, seen) = crate::http::test_server(bytes.clone());
+        let mut remote = LazyRaster::open(&format!("{base}/big.tif")).unwrap();
+        check(&mut remote);
+        let fetched = bytes_requested(&seen);
+        assert!(fetched < tables_len / 4, "{fetched} bytes fetched for {tables_len} bytes of chunk tables");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.tif");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut local = LazyRaster::open(path.to_str().unwrap()).unwrap();
+        check(&mut local);
+    }
+
     #[test]
     fn window_allocation_capacity_overflow_returns_an_error() {
         let error = super::try_new_filled(crate::DataType::F64, usize::MAX, 0.0).unwrap_err();

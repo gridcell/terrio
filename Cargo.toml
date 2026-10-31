@@ -175,3 +175,8 @@ laz = { opt-level = 3 }
 rusty_av1d = { opt-level = 3 }
 image-webp = { opt-level = 3 }
 lz4_flex = { opt-level = 3 }
+
+# Local patch of the tiff crate (see vendor/tiff/TERRIO-PATCH.md): chunk tables of images with
+# 65,536 chunks or more are read per chunk, not whole, on open and on every seek between images.
+[patch.crates-io]
+tiff = { path = "vendor/tiff" }

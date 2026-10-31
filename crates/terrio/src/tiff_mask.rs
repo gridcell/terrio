@@ -62,7 +62,10 @@ fn read_ifd<R: Read + Seek>(f: &mut R, offset: u64, big: bool, le: bool) -> Opti
         f.read_exact(&mut next[..4]).ok()?;
         u32_at(&next) as u64
     };
-    let mut tags = Vec::new();
+    // The entries first (tag, entry size, count, inline value or offset), then the values: the
+    // chunk offsets and byte counts (273, 279, 324, 325) only of a mask image. Of any other image
+    // they can be megabytes, and `find_masks` does not want them.
+    let mut parsed: Vec<(u16, usize, u64, &[u8], usize)> = Vec::new();
     for e in entries.chunks(entry_len) {
         let tag = u16_at(&e[0..2]);
         if !matches!(tag, 254 | 256 | 257 | 258 | 259 | 262 | 266 | 273 | 277 | 278 | 279 | 322 | 323 | 324 | 325) {
@@ -76,6 +79,25 @@ fn read_ifd<R: Read + Seek>(f: &mut R, offset: u64, big: bool, le: bool) -> Opti
             _ => continue,
         };
         let (n, inline, inline_len) = if big { (u64_at(&e[4..12]), &e[12..20], 8) } else { (u32_at(&e[4..8]) as u64, &e[8..12], 4) };
+        parsed.push((tag, size, n, inline, inline_len));
+    }
+    let inline_value = |tag: u16| -> Option<u64> {
+        let (_, size, n, inline, inline_len) = parsed.iter().find(|p| p.0 == tag)?;
+        (*n == 1 && *size <= *inline_len).then(|| match size {
+            2 => u16_at(inline) as u64,
+            4 => u32_at(inline) as u64,
+            _ => u64_at(inline),
+        })
+    };
+    let is_mask = inline_value(254).unwrap_or(0) & 4 != 0
+        && inline_value(262) == Some(4)
+        && inline_value(258).unwrap_or(1) == 1
+        && inline_value(277).unwrap_or(1) == 1;
+    let mut tags = Vec::new();
+    for (tag, size, n, inline, inline_len) in parsed {
+        if matches!(tag, 273 | 279 | 324 | 325) && !is_mask {
+            continue;
+        }
         let len = (n as usize).checked_mul(size)?;
         if len > 1 << 28 {
             continue;
