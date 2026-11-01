@@ -32,6 +32,9 @@
 //! | `TERRIO_HTTP_CACHE_SIZE` (bytes): the block cache of each open file, and the process-wide cache | `CPL_VSIL_CURL_CACHE_SIZE` | 67108864 |
 //! | `TERRIO_HTTP_USERAGENT` | `GDAL_HTTP_USERAGENT` | `terrio/VERSION` |
 //! | `TERRIO_HTTP_LOG=YES`: print each request to standard error | `CPL_CURL_VERBOSE` | off |
+//! | `TERRIO_HTTP_SHARED_CONNECTIONS=NO`: a pool of connections per open file, rather than one the process's files share | — | shared |
+//! | `TERRIO_HTTP_MAX_IDLE_CONNECTIONS`: idle connections kept per host | — | 32 |
+//! | `TERRIO_HTTP_MAX_PARALLEL_RANGES`: range requests a prefetch sends at once | — | 4 |
 //! | `TERRIO_JSON_MAX_SIZE` (bytes, `K`, `M` or `G` suffixes): the largest JSON document fetched whole | `CPL_JSON_MAX_SIZE` | 100 MB |
 //!
 //! Bodies fetched whole are capped: JSON documents (STAC, a search page) at `CPL_JSON_MAX_SIZE`,
@@ -125,6 +128,15 @@ pub struct HttpOptions {
     /// The bytes a remote file's first request fetches (`GDAL_INGESTED_BYTES_AT_OPEN`), when more
     /// than a block: enough for a whole GeoTIFF header in one request.
     pub ingested_bytes_at_open: Option<u64>,
+    /// Whether the files opened in this process share one pool of connections (per set of
+    /// options), so that a file opened again, or by another thread, reuses a connection and its
+    /// TLS session. Without it every open file has its own pool, and so its own handshake.
+    pub shared_connections: bool,
+    /// The idle connections the pool keeps per host.
+    pub max_idle_connections: usize,
+    /// The requests a block prefetch sends at once, when its blocks lie in several runs of the
+    /// file: 1 sends them one after the other.
+    pub max_parallel_ranges: usize,
 }
 
 impl Default for HttpOptions {
@@ -139,6 +151,9 @@ impl Default for HttpOptions {
             user_agent: format!("terrio/{}", crate::VERSION),
             log: false,
             ingested_bytes_at_open: None,
+            shared_connections: true,
+            max_idle_connections: 32,
+            max_parallel_ranges: 4,
         }
     }
 }
@@ -167,6 +182,13 @@ impl HttpOptions {
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|n| *n > 0)
                 .map(|n| n.min(64 << 20)),
+            shared_connections: var("TERRIO_HTTP_SHARED_CONNECTIONS", "")
+                .map_or(d.shared_connections, |v| !matches!(v.to_ascii_uppercase().as_str(), "NO" | "OFF" | "FALSE" | "0")),
+            max_idle_connections: var("TERRIO_HTTP_MAX_IDLE_CONNECTIONS", "").and_then(|v| v.parse().ok()).unwrap_or(d.max_idle_connections),
+            max_parallel_ranges: var("TERRIO_HTTP_MAX_PARALLEL_RANGES", "")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(d.max_parallel_ranges),
         }
     }
 }
@@ -398,6 +420,7 @@ struct Fetched {
 }
 
 /// Makes requests for one remote file: signing, redirects, region discovery and retries.
+#[derive(Clone)]
 struct Client {
     agent: ureq::Agent,
     options: HttpOptions,
@@ -462,6 +485,7 @@ fn redirect_refused(asked: &str, to: &str) -> Error {
     ))
 }
 
+#[derive(Clone)]
 struct S3Auth {
     creds: Option<Credentials>,
     region: Option<String>,
@@ -890,7 +914,13 @@ thread_local! {
 }
 
 /// The settings an agent is built with.
-type AgentSettings = (Option<Duration>, Duration, String);
+type AgentSettings = (Option<Duration>, Duration, String, usize);
+
+/// The agents the process's files share, by settings (see [`HttpOptions::shared_connections`]).
+static SHARED_AGENTS: Mutex<Vec<(AgentSettings, ureq::Agent)>> = Mutex::new(Vec::new());
+
+/// The most agents [`SHARED_AGENTS`] keeps: one per set of options in use.
+const MAX_SHARED_AGENTS: usize = 8;
 
 /// While alive, the requests made on this thread share one agent, and so its connections (and
 /// TLS sessions): a recursive upload, deletion or listing opens one connection per host rather
@@ -918,26 +948,44 @@ impl Drop for AgentScope {
 
 /// The agent requests are sent with: no automatic redirects (followed by [`Client`], which
 /// signs only the first request), no compression. Within an [`AgentScope`], the scope's agent
-/// when its settings are the same.
+/// when its settings are the same; otherwise the process-wide agent of these settings when
+/// [`HttpOptions::shared_connections`] is set, else a new one.
 fn agent(options: &HttpOptions) -> ureq::Agent {
-    let settings: AgentSettings = (options.timeout, options.connect_timeout, options.user_agent.clone());
-    SHARED_AGENT.with(|shared| {
+    let settings: AgentSettings = (options.timeout, options.connect_timeout, options.user_agent.clone(), options.max_idle_connections);
+    let scoped = SHARED_AGENT.with(|shared| {
         let mut shared = shared.borrow_mut();
         if shared.0 == 0 {
-            return new_agent(options);
+            return None;
         }
-        match &shared.1 {
+        Some(match &shared.1 {
             Some((s, agent)) if *s == settings => agent.clone(),
             _ => {
                 let agent = new_agent(options);
-                shared.1 = Some((settings, agent.clone()));
+                shared.1 = Some((settings.clone(), agent.clone()));
                 agent
             }
-        }
-    })
+        })
+    });
+    if let Some(agent) = scoped {
+        return agent;
+    }
+    if !options.shared_connections {
+        return new_agent(options);
+    }
+    let mut agents = SHARED_AGENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, agent)) = agents.iter().find(|(s, _)| *s == settings) {
+        return agent.clone();
+    }
+    let agent = new_agent(options);
+    if agents.len() >= MAX_SHARED_AGENTS {
+        agents.remove(0);
+    }
+    agents.push((settings, agent.clone()));
+    agent
 }
 
 fn new_agent(options: &HttpOptions) -> ureq::Agent {
+    let per_host = options.max_idle_connections.max(1);
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
@@ -945,6 +993,8 @@ fn new_agent(options: &HttpOptions) -> ureq::Agent {
         .user_agent(options.user_agent.as_str())
         .timeout_global(options.timeout)
         .timeout_connect(Some(options.connect_timeout))
+        .max_idle_connections_per_host(per_host)
+        .max_idle_connections(per_host.saturating_mul(4).max(10))
         .build()
         .into()
 }
@@ -1786,6 +1836,14 @@ impl Shared {
     /// the first request returned are not asked again.
     fn fetch_blocks(&mut self, blocks: &[u64], gap: u64) -> io::Result<()> {
         let blocks: Vec<u64> = blocks.iter().copied().filter(|&b| !self.load_cached_block(b)).collect();
+        // The runs to fetch: the first block of each, the bytes of it already held (the first
+        // request's, when the run starts the file) and the range still to ask for.
+        struct Run {
+            start: u64,
+            held: Vec<u8>,
+            range: Option<(u64, u64)>,
+        }
+        let mut runs: Vec<Run> = Vec::new();
         let mut i = 0;
         while i < blocks.len() {
             let start = blocks[i];
@@ -1797,15 +1855,48 @@ impl Shared {
             i += 1;
             let first = start * self.block_size;
             let last = ((end + 1) * self.block_size).min(self.len) - 1;
-            // The first bytes, already held, start the run when it starts the file.
             let held: &[u8] = match &self.prefix {
                 Some(p) if (first as usize) < p.len() => &p[first as usize..p.len().min(last as usize + 1)],
                 _ => &[],
             };
             let from = first + held.len() as u64;
-            let mut data = held.to_vec();
-            if from <= last {
-                let fetched = self.client.fetch(Some((from, last))).map_err(io::Error::other)?;
+            runs.push(Run { start, held: held.to_vec(), range: (from <= last).then_some((from, last)) });
+        }
+        // The responses, by run. One request goes first on its own: it settles the redirects and
+        // the S3 region the others then follow, through clones of the client. The rest go in
+        // parallel, up to `max_parallel_ranges` at a time.
+        let mut responses: Vec<Option<Result<Fetched>>> = runs.iter().map(|_| None).collect();
+        let remote: Vec<usize> = (0..runs.len()).filter(|&k| runs[k].range.is_some()).collect();
+        if let Some((&first, rest)) = remote.split_first() {
+            responses[first] = Some(self.client.fetch(runs[first].range));
+            let parallel = self.client.options.max_parallel_ranges.max(1).min(rest.len());
+            if parallel > 1 && responses[first].as_ref().is_some_and(|r| r.is_ok()) {
+                let client = &self.client;
+                let per_thread = rest.len().div_ceil(parallel);
+                let fetched: Vec<Vec<(usize, Result<Fetched>)>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = rest
+                        .chunks(per_thread)
+                        .map(|group| {
+                            let mut client = client.clone();
+                            let ranges: Vec<(usize, Option<(u64, u64)>)> = group.iter().map(|&k| (k, runs[k].range)).collect();
+                            s.spawn(move || ranges.into_iter().map(|(k, range)| (k, client.fetch(range))).collect::<Vec<_>>())
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Vec::new())).collect()
+                });
+                for (k, r) in fetched.into_iter().flatten() {
+                    responses[k] = Some(r);
+                }
+            } else {
+                for &k in rest {
+                    responses[k] = Some(self.client.fetch(runs[k].range));
+                }
+            }
+        }
+        for (run, response) in runs.into_iter().zip(responses) {
+            let mut data = run.held;
+            if let Some((from, last)) = run.range {
+                let fetched = response.unwrap_or_else(|| Err(Error::Http("a range request was not sent".into()))).map_err(io::Error::other)?;
                 match fetched.status {
                     206 if fetched.data.len() as u64 == last - from + 1 => data.extend_from_slice(&fetched.data),
                     200 if fetched.data.len() as u64 == self.len => {
@@ -1821,7 +1912,7 @@ impl Shared {
                     }
                 }
             }
-            self.store(start, data);
+            self.store(run.start, data);
         }
         Ok(())
     }
